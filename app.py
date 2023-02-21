@@ -404,14 +404,15 @@ def generate2(
 
 def main(
         target=["TARDBP"],  # TARDBP"],
-        weights_path="checkpoints/coco_prefix-029.pt",
+        num_seqs=10,
+        sample="Sample",
+        beam_search="Greedy",
+
+        weights_path="checkpoints/checkpoint.pt",
         prefix_length=10,
         prefix_dim=96,
         prefix_length_clip=10,
         num_layers=8,
-        beam_search="Greedy",
-        num_seqs=10,
-        sample="Sample",
         figsize = (4, 4),
         device=torch.device("cpu")):  # cuda")):
 
@@ -450,7 +451,7 @@ def main(
 
     # sample_a = model.gpt.generate(inputs_embeds=prefix_embed, num_beams=4, do_sample=True)
     # sample_b = model.gpt.generate(inputs_embeds=prefix_embed, penalty_alpha=0.6, top_k=4, max_new_tokens=100)
-    preds = []
+    preds, images = [], []
     for _ in tqdm(range(num_seqs), total=num_seqs, desc="Sequences"):
         if beam_search:
             pred = generate_beam(model, tokenizer, embed=prefix_embed, sample=sample)[0]
@@ -462,20 +463,21 @@ def main(
         # Generate a 2D depiction of the molecule using RDKit
         img = Draw.MolToImage(mol, size=figsize)
 
-        # Display the image using matplotlib
-        plt.imshow(img)
-        plt.axis('off')
-        plt.show()
-        plt.close("all")
-
-    # pred = generate_beam(model, tokenizer, embed=prefix_embed, temperature=1.)
-    # pred = generate2(model, tokenizer, embed=prefix_embed)
+        # # Display the image using matplotlib
+        # plt.imshow(img)
+        # plt.axis('off')
+        # plt.show()
+        # plt.close("all")
+        images.append(img)
+    outputs = preds + images
+    return outputs
 
 
 title = "De novo SMols"
 description = "Generate SMols from a phenotype"
-article="Coming soon"
+article="In this webapp you can supply a target and generate small molecules that will have a desirable/compensatory response to a manipulation of that target."
 options = ["TARDBP", "PKD2", "SNCA", "MAPT", "MECP2", "ERBB2"]
+num_outputs = 5
 gr.inputs.Dropdown(options)
 gr.Radio(["Beam search", "Greedy"])
 demo = gr.Interface(
@@ -483,13 +485,12 @@ demo = gr.Interface(
     inputs=[
         gr.inputs.Dropdown(options),
         gr.Radio(["Beam search", "Greedy"]),
-        gr.Slider(1, 10, value=1),
         gr.Radio(["Sample", "Deterministic"])
     ],
-    outputs="text",
+    outputs=["text"] + ["image"] * num_outputs,
     examples=[
-        ["PKD2", "Greedy", 3, "Sample"],
-        ["TARDBP", "Greedy", 3, "Sample"],
+        ["PKD2", "Greedy", "Sample"],
+        ["TARDBP", "Greedy", "Sample"],
     ],
     title=title,
     description=description,
