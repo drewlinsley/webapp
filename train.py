@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.nn import functional as nnf
 from torch.utils.data import Dataset, DataLoader
 from enum import Enum
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, AdamW, get_linear_schedule_with_warmup
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 from tqdm import tqdm
 import os
 import pickle
@@ -91,6 +91,7 @@ class ClipCocoDataset(Dataset):
         self.normalize_prefix = normalize_prefix
 
         data = np.load("../linear_models/normalized_data-0.npz")
+        # data = np.load("../linear_models/controlled_data-11.npz")
         #     np.savez("batch_normalized_prepped_data.npz".format(target), inchi=inchi, comp_data=comp_data, orf_data=orf_data, orfs=orfs)
         inchi = data["compounds"]
         morphology = data["comp_data"][:, None]
@@ -114,7 +115,7 @@ class ClipCocoDataset(Dataset):
         morphology = morphology[keeps]
 
         # Truncate some of the crazier rows and normalize to [0, 1]
-        thresh = 20
+        thresh = 5  # 20
         mask = (np.abs(morphology.squeeze()) > thresh).sum(1) == 0
         print("Keeping {}/{} (removing {})".format(mask.sum(), len(mask), len(mask) - mask.sum()))
         selfies = selfies[mask]
@@ -130,14 +131,16 @@ class ClipCocoDataset(Dataset):
         mask = (np.abs(target.squeeze()) > thresh).sum(1) == 0
         target = target[mask]
         target = (target - mm) / mx
+        rem_orfs = orfs[~mask]
         orfs = orfs[mask]
+        print("Removing these genes: {}".format(rem_orfs))
         # target = (target - mm) / (mx - mm)
         # target = (target - .5) / .5
 
         from sklearn.decomposition import PCA
         morphology = morphology.squeeze(1)
         target = target.squeeze(1)
-        pca = PCA(n_components=96, whiten=True).fit(morphology)
+        pca = PCA(n_components=128, whiten=True).fit(morphology)
         morphology = pca.transform(morphology)[:, None]
         target = pca.transform(target)[:, None]
         np.savez("preproc_for_test", mm=mm, mx=mx, thresh=thresh, target=target, orfs=orfs)
@@ -435,11 +438,14 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         os.makedirs(output_dir)
     model = model.to(device)
     model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)  # , weight_decay=0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.001)  # , weight_decay=0.0001)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     # datasets = load_data()
     # train_dataloader = DataLoader(train_dataloader["train"], batch_size=batch_size, shuffle=True, drop_last=True)
-    scheduler = get_linear_schedule_with_warmup(
+    # scheduler = get_linear_schedule_with_warmup(
+    #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
+    # )
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
     )
 
@@ -459,6 +465,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
+        avg_losses = []
         for idx, (tokens, mask, prefix) in enumerate(train_dataloader):
             model.zero_grad()
             tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
@@ -467,23 +474,18 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
                 logits = outputs.logits[:, dataset.prefix_length - 1: -1]
                 loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
                 # loss.backward()
-                accelerator.backward(loss)
+                avg_loss = accelerator.gather(loss.repeat(batch_size)).mean()
+                accelerator.backward(avg_loss)
+                # accelerator.backward(loss)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            progress.set_postfix({"loss": loss.item()})
+            avg_loss = avg_loss.item()
+            avg_losses.append(avg_loss)
+            progress.set_postfix({"loss": avg_loss})
             progress.update()
-            if 0:  # (idx + 1) % 10000 == 0:
-                # accelerator.wait_for_everyone()
-                # unwrapped_model = accelerator.unwrap_model(model)
-                # torch.save(
-                #     unwrapped_model.state_dict(),
-                #     os.path.join(output_dir, f"{output_prefix}_latest.pt"),
-                # )
-                save_path = os.path.join(output_dir, f"{output_prefix}_latest")
-                accelerator.wait_for_everyone()
-                # accelerator.save_state(save_path)
-
+        avg_loss = torch.mean(avg_losses)
+        progress.set_postfix({"Average loss": avg_loss})
         progress.close()
         if epoch % args.save_every == 0 or epoch == epochs - 1:
             # accelerator.wait_for_everyone()
@@ -527,7 +529,7 @@ def main():
     args = parser.parse_args()
     prefix_length = args.prefix_length
     dataset = ClipCocoDataset(args.data, prefix_length, normalize_prefix=args.normalize_prefix)
-    prefix_dim = 96  # 640 if args.is_rn else 512
+    prefix_dim = 128  # 640 if args.is_rn else 512
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
         model = ClipCaptionPrefix(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,

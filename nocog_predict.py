@@ -405,7 +405,7 @@ def main(
         target=["TARDBP"],  # TARDBP"],
         weights_path="checkpoints/coco_prefix-029.pt",
         prefix_length=10,
-        prefix_dim=96,
+        prefix_dim=128,
         prefix_length_clip=10,
         num_layers=8,
         beam_search=False,
