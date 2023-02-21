@@ -414,7 +414,7 @@ def main(
         prefix_length_clip=10,
         num_layers=8,
         figsize = (4, 4),
-        device=torch.device("cpu")):  # cuda")):
+        device=torch.device("cuda")):  # cuda")):
 
     sample = sample == "Sample"
     beam_search = beam_search == "Beam search"
