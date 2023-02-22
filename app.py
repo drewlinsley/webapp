@@ -215,7 +215,7 @@ class ClipCaptionModel(nn.Module):
         self.prefix_length = prefix_length
         # self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
         config = AutoConfig.from_pretrained(PRETRAINED)
-        self.gpt = AutoModelForCausalLM(config)  # .from_pretrained(PRETRAINED)
+        self.gpt = AutoModelForCausalLM.from_config(config)  # .from_pretrained(PRETRAINED)
         if freeze:
             for param in self.gpt.parameters():
                 param.requires_grad = False
