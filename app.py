@@ -475,6 +475,7 @@ def main(
     return outputs
 
 
+"""
 title = "De novo SMols"
 description = "Generate SMols from a phenotype"
 article="In this webapp you can supply a target and generate small molecules that will have a desirable/compensatory response to a manipulation of that target."
@@ -498,7 +499,7 @@ demo = gr.Interface(
     description=description,
     article=article).launch(share=True)
 
-
 if __name__ == "__main__":
     demo.launch()
+"""
 
