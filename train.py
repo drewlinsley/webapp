@@ -13,7 +13,7 @@ import sys
 import argparse
 import json
 from typing import Tuple, Optional, Union
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import selfies as sf
 from openbabel import openbabel
 from tqdm import tqdm
@@ -90,8 +90,8 @@ class ClipCocoDataset(Dataset):
         self.prefix_length = prefix_length
         self.normalize_prefix = normalize_prefix
 
-        data = np.load("../linear_models/normalized_data-0.npz")
-        # data = np.load("../linear_models/controlled_data-11.npz")
+        data = np.load("../linear_models/normalized_data-13.npz")
+        # data = np.load("../linear_models/controlled_data-13.npz")
         #     np.savez("batch_normalized_prepped_data.npz".format(target), inchi=inchi, comp_data=comp_data, orf_data=orf_data, orfs=orfs)
         inchi = data["compounds"]
         morphology = data["comp_data"][:, None]
@@ -116,7 +116,10 @@ class ClipCocoDataset(Dataset):
 
         # Truncate some of the crazier rows and normalize to [0, 1]
         thresh = 5  # 20
-        mask = (np.abs(morphology.squeeze()) > thresh).sum(1) == 0
+        if thresh:
+            mask = (np.abs(morphology.squeeze()) > thresh).sum(1) == 0
+        else:
+            mask = np.ones((len(morphology)))
         print("Keeping {}/{} (removing {})".format(mask.sum(), len(mask), len(mask) - mask.sum()))
         selfies = selfies[mask]
         morphology = morphology[mask]
@@ -128,7 +131,10 @@ class ClipCocoDataset(Dataset):
 
         target = data["orf_data"][:, None]
         orfs = data["orfs"]
-        mask = (np.abs(target.squeeze()) > thresh).sum(1) == 0
+        if thresh:
+            mask = (np.abs(target.squeeze()) > thresh).sum(1) == 0
+        else:
+            mask = np.ones((len(morphology)))
         target = target[mask]
         target = (target - mm) / mx
         rem_orfs = orfs[~mask]
@@ -366,7 +372,9 @@ class ClipCaptionModel(nn.Module):
         if "galactica" in PRETRAINED:
             self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)  # , device_map="auto")  # , torch_dtype=torch.float16)
         else:
-            self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
+            config = AutoConfig.from_pretrained(PRETRAINED)
+            config.max_position_embeddings = 2048
+            self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR, config=config)
         if freeze:
             for k, param in self.gpt.named_parameters():
                 if "wte" not in k:
@@ -438,16 +446,16 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         os.makedirs(output_dir)
     model = model.to(device)
     model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.001)  # , weight_decay=0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)  # , weight_decay=0.0001)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     # datasets = load_data()
     # train_dataloader = DataLoader(train_dataloader["train"], batch_size=batch_size, shuffle=True, drop_last=True)
-    # scheduler = get_linear_schedule_with_warmup(
-    #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
-    # )
-    scheduler = get_cosine_schedule_with_warmup(
+    scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
     )
+    # scheduler = get_cosine_schedule_with_warmup(
+    #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
+    # )
 
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, scheduler)
     accelerator.wait_for_everyone()
@@ -474,13 +482,13 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
                 logits = outputs.logits[:, dataset.prefix_length - 1: -1]
                 loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
                 # loss.backward()
-                avg_loss = accelerator.gather(loss.repeat(batch_size)).mean()
-                accelerator.backward(avg_loss)
-                # accelerator.backward(loss)
+                # avg_loss = accelerator.gather(loss.repeat(batch_size)).mean()
+                # accelerator.backward(avg_loss)
+                accelerator.backward(loss)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            avg_loss = avg_loss.item()
+            avg_loss = loss.item()  # avg_loss.item()
             avg_losses.append(avg_loss)
             progress.set_postfix({"loss": avg_loss})
             progress.update()
