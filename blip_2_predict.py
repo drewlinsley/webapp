@@ -27,13 +27,17 @@ import Levenshtein
 import matplotlib.pyplot as plt
 from train import GALACTICA_START, GALACTICA_END
 from train import ClipCaptionModel, MappingType, ClipCaptionPrefix
-from train import PRETRAINED, CACHE_DIR
 
 
 # import torch
-# PRETRAINED = "ncfrey/ChemGPT-1.2B"
-# PRETRAINED = "facebook/galactica-1.3b"
-# CACHE_DIR = "/media/data_cifs/projects/prj_video_imagenet/hf_cache"
+GALACTICA_START = "[START_I_SMILES]"
+GALACTICA_END = "[END_I_SMILES]"
+GALACTICA_START = "[START_SMILES]"
+GALACTICA_END = "[END_SMILES]"
+
+PRETRAINED = "ncfrey/ChemGPT-1.2B"
+PRETRAINED = "facebook/galactica-1.3b"
+CACHE_DIR = "/media/data_cifs/projects/prj_video_imagenet/hf_cache"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 CPU = torch.device("cpu")
 
@@ -67,23 +71,10 @@ def generate_beam(
 
     model.eval()
     if "galactica" in PRETRAINED.lower():
-        stop_token = GALACTICA_END
-        start_token = GALACTICA_START
-        stop_token_index = tokenizer.encode(stop_token)[0]
-        start_token_id = tokenizer.encode(start_token)[0]
-        start_embed = model.gpt.model.decoder.embed_tokens(start_token_id)
+        stop_token = "[END_I_SMILES]"
     else:
         stop_token = "[SEP]"
-        start_token = "[CLS]"
-        stop_token_index = tokenizer.encode(stop_token)[1]
-        start_token_id = tokenizer.encode(start_token)[1]
-        start_embed = model.gpt.transformer.wte(start_token_id)
-    embed = torch.concat((embed, start_embed), 1)
-
     stop_token_index = tokenizer.encode(stop_token)[-1]
-    start_token_id = tokenizer.encode(start_token)
-    start_embed = model.gpt.transformer.wte(start_token_id)
-    embed = torch.concat((embed, start_embed[None, None]), 1)
 
     tokens = None
     scores = None
@@ -159,7 +150,7 @@ def generate_beam(
                     generated.shape[0], 1, -1
                 )
             else:
-                raise NotImplementedError
+                import pdb;pdb.set_trace()
             generated = torch.cat((generated, next_token_embed), dim=1)
             is_stopped = is_stopped + next_tokens.eq(stop_token_index).squeeze()
             if is_stopped.all():
@@ -199,18 +190,9 @@ def generate2(
     model.eval()
     if "galactica" in PRETRAINED.lower():
         stop_token = GALACTICA_END
-        start_token = GALACTICA_START
-        stop_token_index = tokenizer.encode(stop_token)[0]
-        start_token_id = tokenizer.encode(start_token)[0]
-        start_embed = model.gpt.model.decoder.embed_tokens(torch.tensor(start_token_id).to(embed.device))
     else:
         stop_token = "[SEP]"
-        start_token = "[CLS]"
-        stop_token_index = tokenizer.encode(stop_token)[1]
-        start_token_id = tokenizer.encode(start_token)[1]
-        start_embed = model.gpt.transformer.wte(torch.tensor(start_token_id).to(embed.device))
-    embed = torch.concat((embed, start_embed[None, None]), 1)
-
+    stop_token_index = tokenizer.encode(stop_token)[-1]
     generated_list = []
     filter_value = -float("Inf")
     device = next(model.parameters()).device
@@ -224,6 +206,7 @@ def generate2(
 
             for i in range(entry_length):
 
+                import pdb;pdb.set_trace()
                 outputs = model.gpt(inputs_embeds=generated)
                 logits = outputs.logits
                 logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0)
@@ -266,11 +249,11 @@ def generate2(
                 if stop_token_index == next_token.item():
                     break
 
-            import pdb;pdb.set_trace()
             output_list = list(tokens.squeeze().cpu().numpy())
+            import pdb;pdb.set_trace()
             if "galactica" in PRETRAINED.lower():
                 end_pos = np.where((np.asarray(output_list) == stop_token_index))[0][0]
-                output_text = tokenizer.decode(output_list[:end_pos])  # Remove end_pos if you want to hallucinate descriptions
+                output_text = tokenizer.decode(output_list[1:end_pos])  # Remove end_pos if you want to hallucinate descriptions
             else:
                 output_text = sf.decoder(tokenizer.decode(output_list, skip_special_tokens=True, clean_up_tokenization_spaces=True).replace(" ", ""))
             generated_list.append(output_text)
@@ -290,11 +273,8 @@ def generate2(
 
 def main(
         target=["PKD2"],  # TARDBP"],
-        weights_path="checkpoints/coco_prefix-004.pt",
+        weights_path="checkpoints/coco_prefix-002.pt",
         # prefix_length=30,  # 40,
-        prefix_dim=1024,
-        # prefix_length_clip=40,  # 40,
-        # num_layers=8,
         beam_search=False,
         num_seqs=10,
         sample=False,
@@ -313,25 +293,25 @@ def main(
     parser.add_argument('--permutation', dest='permutation', action='store_true', default=False)
     parser.add_argument('--test_set', dest='test_set', action='store_true', default=False)
     parser.add_argument('--mapping_type', type=str, default='transformer', help='mlp/transformer')
-    parser.add_argument('--num_layers', type=int, default=12)
+    parser.add_argument('--num_layers', type=int, default=8)
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
     args = parser.parse_args()
     prefix_length = args.prefix_length
 
-    if "gpt" in PRETRAINED:
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(PRETRAINED)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
-    args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
-    if args.only_prefix:
-        model = ClipCaptionPrefix(args.prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
-                                  num_layers=args.num_layers, mapping_type=args.mapping_type)
-    else:
-        model = ClipCaptionModel(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
-                                  num_layers=args.num_layers, mapping_type=args.mapping_type)
+    tokenizer = AutoTokenizer.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
+
+    # model = torch.compile(model)
+    from modeling_blip_2 import Blip2ForConditionalGeneration
+    from configuration_blip_2 import (
+        Blip2Config,
+    )
+    # Initializing BLIP-2 vision, BLIP-2 Q-Former and language model configurations
+    text_config = AutoConfig.from_pretrained(PRETRAINED)
+    config = Blip2Config(text_config=text_config)
+    model = Blip2ForConditionalGeneration(config)
+    # model = Blip2ForConditionalGeneration.from_pretrained(weights_path)
+
     weights = torch.load(weights_path, map_location=CPU)
-    # weights = {k.split("_orig_mod.")[1]: v for k, v in weights.items()}
-    # weights = {k: v for k, v in weights.items() if "clip_project" in k}  # Limit to non-LM weights
     keys = [k for k, v in model.named_parameters()]
     both = [k for k in weights.keys() if k in keys]
     leftover =  [k for k in weights.keys() if k not in keys]
@@ -340,19 +320,14 @@ def main(
     model = model.eval()
     model = model.to(device)
 
-    if "gpt" in PRETRAINED:
-        name = "ncfrey"
-    else:
-        name = "galactica"
-
-    preproc = np.load("{}_controlled_preproc_for_train.npz".format(name), allow_pickle=True)
+    preproc = np.load("galactica_cnn_emb_preproc_for_train.npz", allow_pickle=True)
     train_morphology = preproc["train_morphology"]
     mn, mx = train_morphology.min(0), train_morphology.max(0)
     mn = torch.tensor(mn).to(device).float()
     mx = torch.tensor(mx).to(device).float()
 
     if args.test_set:
-        preproc = np.load("{}_controlled_preproc_for_train.npz".format(name), allow_pickle=True)
+        preproc = np.load("galactica_cnn_emb_preproc_for_train.npz", allow_pickle=True)
         morphology = preproc["test_morphology"][:6*8*10]
         selfies = preproc["test_selfies"]
         if args.permutation:
@@ -364,38 +339,20 @@ def main(
         prefixes = torch.tensor(morphology[:num_seqs]).to(device).float()
         labels = selfies[:num_seqs]
     else:
-        preproc = np.load("{}_controlled_preproc_for_test.npz".format(name), allow_pickle=True)  # "preproc_for_test.npz")
+        preproc = np.load("galactica_cnn_emb_preproc_for_test.npz", allow_pickle=True)  # "preproc_for_test.npz")
         orf_morphology = preproc["target"]
         orfs = preproc["orfs"]
         idx = np.where(orfs == target)[0][0]
         prefixes = torch.tensor(orf_morphology[[idx]].repeat(num_seqs, 0)).to(device).float()
         labels = torch.ones(len(prefixes))
 
-    # Normalize to [-1, 1]
+    #  Normalize to [-1, 1]
     prefixes = (prefixes - mn) / (mx - mn)
     prefixes = (prefixes - 0.5) / 0.5
 
-    model.clip_project.eval()
-    model.gpt.eval()
-    with torch.no_grad():
-        prefix_embed = model.clip_project(prefixes).reshape(len(prefixes), prefix_length, -1)
-
-    # # Attach start tokens to each
-    # if "galactica" in PRETRAINED.lower():
-    #     token = tokenizer.encode(GALACTICA_START)
-    #     start_encoding = model.gpt.model.decoder.embed_tokens(torch.tensor(token).to(device))[None]
-    # else:
-    #     raise NotImplementedError("Architecture is not yet implemented.")
-    # start_encoding = start_encoding.repeat(len(prefix_embed), 1, 1)
-    # prefix_embed = torch.concat((prefix_embed, start_encoding), 1)  # Append start token
-
-    # https://discuss.huggingface.co/t/how-to-generate-a-sequence-using-inputs-embeds-instead-of-input-ids/4145/3
-    # https://discuss.huggingface.co/t/how-to-generate-a-sequence-using-inputs-embeds-instead-of-input-ids/4145/3
-    # https://huggingface.co/docs/transformers/internal/generation_utils
-    # https://huggingface.co/docs/transformers/generation_strategies#contrastive-search
-
-    # sample_a = model.gpt.generate(inputs_embeds=prefix_embed, num_beams=4, do_sample=True)
-    # sample_b = model.gpt.generate(inputs_embeds=prefix_embed, penalty_alpha=0.6, top_k=4, max_new_tokens=100)
+    import pdb;pdb.set_trace()
+    input_ids = tokenizer.encode(GALACTICA_START) 
+    model.generate(image_embeds=prefixes[[0]], input_ids=input_ids)
     preds, outs, eds = [], [], []
     for idx in tqdm(range(num_seqs), total=num_seqs, desc="Sequences"):
         if beam_search:
@@ -416,7 +373,6 @@ def main(
         # plt.show()
         # plt.close("all")
 
-    import pdb;pdb.set_trace()
     preds, labels, outs, eds
     if permutation:
         np.savez("perm_test", preds=preds, labels=labels, outs=outs, eds=eds)

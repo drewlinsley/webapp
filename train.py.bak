@@ -14,45 +14,46 @@ import argparse
 import json
 from typing import Tuple, Optional, Union
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model, prepare_model_for_int8_training
-# from openbabel import openbabel
+import selfies as sf
+from openbabel import openbabel
 from glob import glob
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from functools import partial
 from tqdm import tqdm as std_tqdm
-import wandb
-
-
 tqdm = partial(std_tqdm, dynamic_ncols=True)
 
 
-TOKENS = {
-    "galactica": {"bos_token_id": 0, "eos_token_id": 2, "pad_token_id": 1,},
-}
-
-
-# GALACTICA_START = "[START_I_SMILES]"
-# GALACTICA_END = "[END_I_SMILES]"
-GALACTICA_START = "[START_SMILES]"
-GALACTICA_END = "[END_SMILES]"
-PRETRAINED = "ncfrey/ChemGPT-1.2B"
-# PRETRAINED = "ncfrey/ChemGPT-19M"
-# PRETRAINED = "ncfrey/ChemGPT-4.7M"
+# PRETRAINED = "ncfrey/ChemGPT-1.2B"
+PRETRAINED = "ncfrey/ChemGPT-19M"
 # PRETRAINED = "facebook/galactica-120b"
-PRETRAINED = "facebook/galactica-1.3b"
-# PRETRAINED = "../smiles-gpt/checkpoints/benchmark-10m"
-# PRETRAINED = "facebook/galactica-6.7b"
-# PRETRAINED = "DeepChem/ChemBERTa-77M-MLM"
-MODEL = "llm_weights/step_3000_eval_0.6366949081420898.pth"
-
-myhost = os.uname()[1]
-if "oscar" in myhost:
-    CACHE_DIR = "/cifs/data/tserre_lrs/projects/prj_video_imagenet/hf_cache"
-else:
-    CACHE_DIR = "/media/data_cifs/projects/prj_video_imagenet/hf_cache"
+# PRETRAINED = "facebook/galactica-1.3b"
+# PRETRAINED = "gpt_test/benchmark-5m"
+CACHE_DIR = "/media/data_cifs/projects/prj_video_imagenet/hf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+
+def get_smiles_from_inchi(inchi):
+    """Convert smiles to inchi via openbabel.
+
+    Thank you openai chatbot!"""
+    obConversion = openbabel.OBConversion()
+    obConversion.SetInAndOutFormats("inchi", "smi")
+
+    mol = openbabel.OBMol()
+    obConversion.ReadString(mol, inchi)
+
+    smiles = obConversion.WriteString(mol)
+    return smiles.split("\t")[0]
+
+
+def sf_decode(s):
+    try:
+        sm = sf.encoder(s)
+    except:
+        sm = False
+    return sm
 
 
 class MappingType(Enum):
@@ -66,13 +67,12 @@ class ClipCocoDataset(Dataset):
         return len(self.captions_tokens)
 
     def pad_tokens(self, item: int):
-        raise RuntimeError("Depreciated")
         tokens = self.captions_tokens[item]
         # if "galactica" in PRETRAINED:
         #     pad_tok = 1
         # else:
         #     pad_tok = -1
-        pad_tok = 1
+        pad_tok = -1
         padding = self.max_seq_len - tokens.shape[0]
         if padding > 0:
             # tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
@@ -90,40 +90,32 @@ class ClipCocoDataset(Dataset):
         return tokens, mask
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
-        # tokens, mask = self.pad_tokens(item)
-        tokens = self.captions_tokens[item]
-        mask = self.masks[item]
+        tokens, mask = self.pad_tokens(item)
         # prefix = self.prefixes[self.caption2embedding[item]]
-        prefix = self.prefixes[item]  # .reshape(1, -1)
+        prefix = self.prefixes[item]
+        if 0:  # self.normalize_prefix:
+            prefix = prefix.float()
+            prefix = prefix / prefix.norm(2, -1)
         return tokens, mask, prefix
 
     def __init__(self, d,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False, pca=False, fold="train", mn=None, mx=None):
 
         # self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
-        if "gpt" in PRETRAINED.lower():
+        if "gpt" in PRETRAINED:
             self.tokenizer = PreTrainedTokenizerFast.from_pretrained(PRETRAINED)
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)  # , use_fast=False)  # JUST ADDED FAST=FALSE
-        if self.tokenizer.pad_token_id is None:
-            if "galactica" in PRETRAINED.lower():
-                td = TOKENS["galactica"]
-            else:
-                raise NotImplementedError(PRETRAINED)
-            self.tokenizer.pad_token_id = td["pad_token_id"]
-            self.tokenizer.eos_token_id = td["eos_token_id"]
-            self.tokenizer.bos_token_id = td["bos_token_id"]
-        self.pad_token_id = self.tokenizer.pad_token_id
+            self.tokenizer = AutoTokenizer.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
         self.prefix_length = prefix_length
         self.normalize_prefix = normalize_prefix
 
         if fold == "train":
-            morphology, mols = d["train_morphology"], d["train_mols"]
+            morphology, selfies = d["train_morphology"], d["train_selfies"]
             self.min, self.max = morphology.min(0), morphology.max(0)
         else:
-            morphology, mols = d["test_morphology"], d["test_mols"]
-            # morphology = morphology[:6*8*10]
-            # mols = mols[:6*8*10]
+            morphology, selfies = d["test_morphology"], d["test_selfies"]
+            morphology = morphology[:6*8*10]
+            selfies = selfies[:6*8*10]
             self.min, self.max = mn, mx
 
         # Normalize to [-1, 1]
@@ -139,63 +131,22 @@ class ClipCocoDataset(Dataset):
         morphology = torch.tensor(morphology)
 
         # Prepare for training
-        self.prefixes = morphology.reshape(len(morphology), -1)
-        self.captions = mols  # smiles
-        captions_raw = np.copy(mols)  # smiles)
-
-        self.max_seq_len = 80  # 96  # 128
-        # if "smiles-gpt" in PRETRAINED:
-        #     pad_tok = 0
-        # else:
-        #     pad_tok = self.tokenizer.pad_token_id  # 1
+        self.prefixes = morphology
+        self.captions = selfies  # smiles
+        captions_raw = np.copy(selfies)  # smiles)
 
         self.captions_tokens = []
         self.caption2embedding = []
-        self.masks = []
-        # max_seq_len = 0
-        assert len(captions_raw) == len(morphology), "Different number of compounds and morphologies."
-        keep_morph = []
+        max_seq_len = 0
         for caption, emb in tqdm(zip(captions_raw, morphology), desc="Processing", total=len(morphology)):
-
-            if len(caption) > self.max_seq_len:
-                keep_morph.append(False)
-                continue  # Remove these from training
-
             if "galactica" in PRETRAINED:
-                caption = GALACTICA_START + caption + GALACTICA_END
-            #     caption = caption + GALACTICA_END
-            #     # caption = "[START_SMILES]" + caption + "[END_SMILES]"
-            elif "smiles-gpt" in PRETRAINED:
-                pass
-                # caption = "<s>" + caption + "</s>"
-            else:
-                caption = "[CLS]" + caption
+                caption = "[START_I_SMILES]" + caption + "[END_I_SMILES]"
 
-            tokens = self.tokenizer.encode(caption, return_tensors="pt")
-            # tokens = [0] + tokens  # Add BOS token
-            # tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-            # tokens = self.tokenizer.encode(caption)
-            # tokens = torch.tensor(tokens, dtype=torch.int64)
-            padding = self.max_seq_len - tokens.shape[0]
-            if padding > 0:
-                # tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
-                tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) + self.pad_token_id))
-            elif padding < 0:
-                tokens = tokens[:self.max_seq_len]
-
-            mask = tokens.gt(self.pad_token_id)  # mask is zero where we out of sequence
-            # tokens[~mask] = 0
-            mask = mask.float()
-            # mask = torch.cat((torch.ones(self.prefix_length + 1), mask), dim=0)  # adding prefix mask
-            mask = torch.cat((torch.ones(self.prefix_length), mask), dim=0)  # adding prefix mask
-
-            self.captions_tokens.append(tokens)  # torch.tensor(self.tokenizer.encode(caption), dtype=torch.int64))
+            self.captions_tokens.append(torch.tensor(self.tokenizer.encode(caption), dtype=torch.int64))
             self.caption2embedding.append(emb)
-            self.masks.append(mask)
-            keep_morph.append(True)
-        keep_morph = np.asarray(keep_morph)
-        self.prefixes = self.prefixes[keep_morph]
-        self.filtered_mols = captions_raw[keep_morph]
+            max_seq_len = max(max_seq_len, self.captions_tokens[-1].shape[0])
+        all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()  # DEBUG
+        self.max_seq_len = 96  # int(all_len.max())  # min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
 
 
 class MLP(nn.Module):
@@ -203,14 +154,13 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.GELU):
+    def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.Tanh):
         super(MLP, self).__init__()
         layers = []
         for i in range(len(sizes) - 1):
             layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=bias))
             if i < len(sizes) - 2:
                 layers.append(act())
-                layers.append(nn.LayerNorm(sizes[i + 1], elementwise_affine=True))
         self.model = nn.Sequential(*layers)
 
 
@@ -240,8 +190,8 @@ class MultiHeadAttention(nn.Module):
         self.scale = head_dim ** -0.5
         self.to_queries = nn.Linear(dim_self, dim_self, bias=bias)
         self.to_keys_values = nn.Linear(dim_ref, dim_self * 2, bias=bias)
-        self.q_norm = nn.LayerNorm(dim_self, elementwise_affine=True)
-        self.k_norm = nn.LayerNorm(dim_self * 2, elementwise_affine=True)
+        self.q_norm = nn.LayerNorm(dim_self, elementwise_affine=False)
+        self.k_norm = nn.LayerNorm(dim_self * 2, elementwise_affine=False)
         self.project = nn.Linear(dim_self, dim_self)
         self.dropout = nn.Dropout(dropout)
 
@@ -333,17 +283,15 @@ class TransformerMapper(nn.Module):
         prefix = self.prefix_const.unsqueeze(0).expand(x.shape[0], *self.prefix_const.shape)
         prefix = torch.cat((x, prefix), dim=1)
         out = self.transformer(prefix)[:, self.clip_length:]
-
-        # Concatenate start token
         # out = self.trans_norm(out)
         return out
 
-    def __init__(self, dim_clip: int, dim_embedding: int, prefix_length: int, clip_length: int, num_layers: int = 8, num_heads: int = 8):
+    def __init__(self, dim_clip: int, dim_embedding: int, prefix_length: int, clip_length: int, num_layers: int = 8, num_heads: int = 16):
         super(TransformerMapper, self).__init__()
         self.clip_length = clip_length
         self.transformer = Transformer(dim_embedding, num_heads, num_layers)
         self.linear = nn.Linear(dim_clip, clip_length * dim_embedding)
-        self.prefix_const = nn.Parameter(torch.randn(prefix_length, dim_embedding) * 1e-4, requires_grad=True)
+        self.prefix_const = nn.Parameter(torch.randn(prefix_length, dim_embedding), requires_grad=True)
         # self.trans_norm = nn.LayerNorm(dim_embedding) 
 
 
@@ -354,81 +302,64 @@ class ClipCaptionModel(nn.Module):
 
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
-        if "galactica" in PRETRAINED.lower():
-            if self.use_lora:
-                embedding_text = self.gpt.model.model.decoder.embed_tokens(tokens)
-            else:
-                embedding_text = self.gpt.model.decoder.embed_tokens(tokens)
-        elif "bert" in PRETRAINED.lower():
-            embedding_text = self.gpt.roberta.embeddings.word_embeddings(tokens)
-        elif "gpt" in PRETRAINED.lower():
-            embedding_text = self.gpt.transformer.wte(tokens)
+        if "galactica" in PRETRAINED:
+            embedding_text = self.gpt.model.decoder.embed_tokens(tokens)
         else:
             embedding_text = self.gpt.transformer.wte(tokens)
+        # import pdb;pdb.set_trace()
+        # [x for x in self.gpt.parameters()][-1].dtype
+        # [x for x in self.clip_project.parameters()][-1].dtype
         prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
-        # embedding_cat = torch.cat((prefix_projections, start_token_id), dim=1)
+        # if "galactica" in PRETRAINED:
+        #     prefix_projections = prefix_projections / 20  # DEBUG
+        # else:
+        #     prefix_projections = prefix_projections / 50
+        if 0:  # "galactica" in PRETRAINED:
+            if not self.CHECKED:
+                dtype, device = prefix_projections.dtype, prefix_projections.device
+                if self.START_SMILES.dtype != dtype:
+                    self.START_SMILES = self.START_SMILES.to(dtype)
+                if self.START_SMILES.device != device:
+                    self.START_SMILES = self.START_SMILES.to(device)
+                self.CHECKED = True
+            embedding_cat = torch.cat((prefix_projections, self.START_SMILES, embedding_text), dim=1)
+        else:
+            embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-
         out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
-                 num_layers: int = 8, mapping_type: MappingType = MappingType.MLP, use_lora=True):
+                 num_layers: int = 8, mapping_type: MappingType = MappingType.MLP, freeze=True):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
-        self.use_lora = use_lora
         # self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
-        print("Loading LM")
-        if "galactica" in PRETRAINED.lower():
-            self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)  # , torch_dtype=torch.float8)  # , torch_dtype=torch.float16)
-            # self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR, load_in_8bit=True, device_map="sequential")
-            # self.gpt = prepare_model_for_int8_training(self.gpt)
-
-            if use_lora:
-
-                target_modules = ["q_proj", "v_proj"]
-                config = LoraConfig(
-                    r=16, lora_alpha=32, target_modules=target_modules, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
-                )
-                self.gpt = get_peft_model(self.gpt, config)
-
-            # self.gpt.gradient_checkpointing_enable()
+        if "galactica" in PRETRAINED:
+            self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)  # , device_map="auto")  # , torch_dtype=torch.float16)
             # self.START_SMILES = 21  # self.tokenizer.encode("[START_I_SMILES]")
             # self.CHECKED = False
-        elif "gpt" in PRETRAINED.lower():
-            self.gpt = GPT2LMHeadModel.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
-            # self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
+        elif "gpt" in PRETRAINED:
+            self.gpt = GPT2LMHeadModel.from_pretrained(PRETRAINED)
         else:
-            # config = AutoConfig.from_pretrained(PRETRAINED)
-            # config.is_decoder = True
-            # config.max_position_embeddings
+            config = AutoConfig.from_pretrained(PRETRAINED)
+            config.max_position_embeddings
             # config.max_position_embeddings = 2048
-            self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)  # , config=config)  # , torch_dtype=torch.float16)
+            self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR, config=config)  # , torch_dtype=torch.float16)
         # self.gpt.to(dtype)
-        if use_lora == False:
+        if freeze:
             for k, param in self.gpt.named_parameters():
-                if 1:  # if "wte" not in k:  #  and "embed_tokens" not in k:  # DO NOT FINETUNE FALACTICA EMB
+                if "wte" not in k:  #  and "embed_tokens" not in k:  # DO NOT FINETUNE FALACTICA EMB
                 # if "wte" not in k and "embed_tokens" not in k:  # DO NOT FINETUNE FALACTICA EMB
                     param.requires_grad = False
             self.gpt.eval()
 
-        if "galactica" in PRETRAINED.lower():
-            if use_lora:
-                self.gpt_embedding_size = self.gpt.model.model.decoder.embed_tokens.weight.shape[1]
-            else:
-                self.gpt_embedding_size = self.gpt.model.decoder.embed_tokens.weight.shape[1]
+        if "galactica" in PRETRAINED:
+            self.gpt_embedding_size = self.gpt.model.decoder.embed_tokens.weight.shape[1]
             # self.START_SMILES = self.gpt.model.decoder.embed_tokens(torch.tensor(self.START_SMILES))[None, None]
-        elif "gpt" in PRETRAINED.lower():
-            self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
-            # self.gpt = AutoModelForCausalLM.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR)
-        elif "bert" in PRETRAINED.lower():
-            self.gpt_embedding_size = self.gpt.roberta.embeddings.word_embeddings.weight.shape[1]
         else:
             self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
-
         if mapping_type == MappingType.MLP:
             self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
                                      self.gpt_embedding_size * prefix_length)).half()
@@ -479,33 +410,21 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
     return model, parser
 
 
-def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: ClipCocoDataset, model: ClipCaptionModel, args, sampler, pad_token,
-          lr: float = 5e-5, warmup_steps: int = 10, output_dir: str = ".", output_prefix: str = ""):  # 2e-5 and 5000 steps is the normal
+def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: ClipCocoDataset, model: ClipCaptionModel, args,
+          lr: float = 5e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):  # 2e-5 and 5000 steps is the normal
 
     # device = accelerator.device  # torch.device('cuda:0')
     batch_size = args.bs
-    test_batch_size = args.test_bs
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.00001)
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=sampler,  # shuffle=True,
-        drop_last=True,
-        num_workers=24,
-        pin_memory=True)
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=test_batch_size,
-        shuffle=False,
-        drop_last=True,
-        num_workers=24,
-        pin_memory=True)
+    # model = model.to(device)
+    # model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.00001)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=24, pin_memory=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=24, pin_memory=True)
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * (len(train_dataloader) // batch_size)
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
     )
     # scheduler = get_cosine_schedule_with_warmup(
     #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
@@ -513,15 +432,10 @@ def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: Cli
     if args.state is not None:
         accelerator.load_state(args.state)
 
-    # if "galactica" in PRETRAINED.lower():
-    #     ignore_index = 1
-    # else:
-    #     ignore_index = 0
-    ignore_index = pad_token
     model, optimizer, train_dataloader, test_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, test_dataloader, scheduler)
     device = accelerator.device
-    # model.to(device)
-    # avg_loss = torch.tensor(0).float().to(device)
+    model.to(device)
+    avg_loss = torch.tensor(0).float().to(device)
     # model, model.clip_project, model.gpt, optimizer, train_dataloader, test_dataloader, scheduler = accelerator.prepare(model, model.clip_project, model.gpt, optimizer, train_dataloader, test_dataloader, scheduler)
     # accelerator.wait_for_everyone()
     accelerator.register_for_checkpointing(scheduler)
@@ -536,27 +450,21 @@ def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: Cli
         # model.clip_project.train() 
         # model.gpt2.eval()
         # accelerator.wait_for_everyone()
-        avg_loss = torch.tensor(0).float().to(device)  # avg_loss = 0.
+        avg_loss = 0.
         for idx, (tokens, mask, prefix) in enumerate(train_dataloader):
             # model.zero_grad()
             optimizer.zero_grad(set_to_none=True)
             # tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
             mask = mask.to(prefix.device)
-            with accelerator.accumulate(model):
-                outputs = model(tokens, prefix, mask, labels=tokens)
+            if 1:  # with accelerator.accumulate(model):
+                outputs = model(tokens, prefix, mask)
                 logits = outputs.logits[:, train_dataset.prefix_length - 1: -1]  # .float()
-                # logits = outputs.logits[:, train_dataset.prefix_length: -1]  # .float()
                 # FIND WHERE THE END_I_SMILES IS AND ONLY EVAL UNTIL THERE -- INDEX=22
-                loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=ignore_index)
+                loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
                 # loss.backward()
                 # avg_loss = accelerator.gather(loss.repeat(batch_size)).mean()
                 # accelerator.backward(avg_loss)
                 accelerator.backward(loss)
-                #params = {k: v for k, v in model.named_parameters()}
-                #print(params["clip_project.transformer.layers.1.mlp.fc2.weight"].grad)
-                #os._exit(1)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 # accelerator.unscale_gradients(optimizer=optimizer)
                 optimizer.step()
                 scheduler.step()
@@ -570,11 +478,9 @@ def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: Cli
             # avg_losses.append(loss)
             progress.set_postfix({"train_loss": loss})
             progress.update()
-            # accelerator.log({"epoch": epoch, "training_loss": loss}, step=step)
+            accelerator.log({"epoch": epoch, "training_loss": loss}, step=step)
         # avg_loss = np.mean([x.item() for x in avg_losses])
-        avg_loss = avg_loss.item() / float(idx + 1)
-        progress.set_postfix({"Average train loss": avg_loss})
-        accelerator.log({"epoch": epoch, "training_loss": avg_loss})  # , step=step)
+        progress.set_postfix({"Average train loss": (avg_loss.item() / float(idx + 1))})
 
         # Evaluate on test set
         model.eval()
@@ -584,11 +490,10 @@ def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: Cli
             avg_loss = 0
             for idx, (tokens, mask, prefix) in enumerate(test_dataloader):
                 # tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
-                if 1:  # with accelerator.accumulate(model):
-                    outputs = model(tokens, prefix, mask, labels=tokens)
-                    logits = outputs.logits[:, test_dataset.prefix_length - 1: -1]  # -1]  # .float()
-                    # logits = outputs.logits[:, train_dataset.prefix_length: -1]  # .float()
-                    loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=ignore_index)
+                with accelerator.accumulate(model):
+                    outputs = model(tokens, prefix, mask)
+                    logits = outputs.logits[:, test_dataset.prefix_length - 1: -1]  # .float()
+                    loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
                 avg_loss += loss
                 # avg_losses.append(loss)
                 accelerator.log({"epoch": epoch, "eval_loss": loss}, step=step)
@@ -599,15 +504,15 @@ def train(accelerator, logger, train_dataset: ClipCocoDataset, test_dataset: Cli
             check_avg_loss = avg_loss.item()
             progress.set_postfix({"Average test loss": avg_loss})
             progress.close()
-            if args.save_every > 0 and check_avg_loss < best_test:  # epoch % args.save_every == 0 or epoch == epochs - 1:
+            if check_avg_loss < best_test:  # epoch % args.save_every == 0 or epoch == epochs - 1:
                 best_test = check_avg_loss
                 save_path = os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt")
-                # accelerator.wait_for_everyone()
-                # unwrapped_model = accelerator.unwrap_model(model)
-                # accelerator.log("Saving {}".format(save_path), step=idx)
-                # torch.save(unwrapped_model.state_dict(), save_path)
-                # accelerator.save_state(output_dir=save_path)
-                accelerator.save(accelerator.unwrap_model(model).state_dict(), save_path)
+            # accelerator.wait_for_everyone()
+            # unwrapped_model = accelerator.unwrap_model(model)
+            # accelerator.log("Saving {}".format(save_path), step=idx)
+            # torch.save(unwrapped_model.state_dict(), save_path)
+            # accelerator.save_state(output_dir=save_path)
+            accelerator.save(accelerator.unwrap_model(model).state_dict(), save_path)
     accelerator.end_training()
     return model
 
@@ -620,32 +525,27 @@ def main():
     parser.add_argument('--prefix', default='coco_prefix', help='prefix for saved filenames')
     parser.add_argument('--epochs', type=int, default=120)
     parser.add_argument('--save_every', type=int, default=1)
-    parser.add_argument('--prefix_length', type=int, default=30)
-    parser.add_argument('--prefix_length_clip', type=int, default=30)
-    parser.add_argument('--bs', type=int, default=16)  # 12
-    parser.add_argument('--test_bs', type=int, default=32)  # 16
+    parser.add_argument('--prefix_length', type=int, default=40)
+    parser.add_argument('--prefix_length_clip', type=int, default=40)
+    parser.add_argument('--bs', type=int, default=64)  # 12
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
-    parser.add_argument('--mapping_type', type=str, default="transformer")  # 'mlp', help='mlp/transformer')
+    parser.add_argument('--mapping_type', type=str, default='transformer', help='mlp/transformer')
     parser.add_argument('--state', type=str, default=None, help='ckpt path')
-    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=8)
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
-    parser.add_argument('--lr', dest='lr', default=5e-4)  # 5e-5)
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
     parser.add_argument('--log', action='store_true', default=False)
-    parser.add_argument('--max_grad_norm', type=float, default=10)
     args = parser.parse_args()
     prefix_length = args.prefix_length
     assert args.train_data is not None, "Pass a path for your preprocessed training data."
     assert args.eval_data is not None, "Pass a path for your preprocessed eval data."
 
+    accelerator = Accelerator(log_with="wandb")
     if args.log:
-        accelerator = Accelerator(log_with="wandb")  # , gradient_accumulation_steps=8)
         accelerator.init_trackers("CLIP")
-    else:
-        accelerator = Accelerator()
     logger = get_logger(__name__, log_level="DEBUG")  # INFO")
     with accelerator.main_process_first():
-        d = np.load(args.train_data, allow_pickle=True)
+        d = np.load(args.train_data)
         # logger.info("Building train data", main_process_only=True)
         print("Building train data")
         train_dataset = ClipCocoDataset(d, prefix_length, normalize_prefix=args.normalize_prefix, fold="train")
@@ -653,16 +553,13 @@ def main():
         # logger.info("Building eval data", main_process_only=True)
         print("Building eval data")
         test_dataset = ClipCocoDataset(d, prefix_length, normalize_prefix=args.normalize_prefix, fold="eval", mn=mn, mx=mx)
-        train_compounds = train_dataset.filtered_mols
-        ucs, class_sample_count = np.unique(train_compounds, return_counts=True)
-        weight = {u: 1. / c for u, c in zip(ucs, class_sample_count)}
-        samples_weight = np.asarray([weight[t] for t in train_compounds])
-        samples_weight = torch.from_numpy(samples_weight)
-        sampler = torch.utils.data.WeightedRandomSampler(samples_weight, len(samples_weight))
         del d.f
         d.close()
 
-    prefix_dim = 1024  # 1280 * 5
+    if "normalized" in args.train_data:
+        prefix_dim = 1024  # 640 if args.is_rn else 512
+    else:
+        prefix_dim = 2102 
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
         model = ClipCaptionPrefix(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
@@ -670,12 +567,16 @@ def main():
         logger.info("Train only prefix", main_process_only=True)
     else:
         model = ClipCaptionModel(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
-                                  num_layers=args.num_layers, mapping_type=args.mapping_type)  # , start_token_id=start_token_id)
+                                  num_layers=args.num_layers, mapping_type=args.mapping_type)
         logger.info("Train both prefix and GPT", main_process_only=True)
         # sys.stdout.flush()
 
-    # model = torch.compile(model)
-    train(accelerator, logger, train_dataset, test_dataset, model, args, sampler=sampler, output_dir=args.out_dir, output_prefix=args.prefix, lr=args.lr, pad_token=train_dataset.pad_token_id)
+    # Test dataloaders
+    import pdb;pdb.set_Trace()
+    train_dataset
+    test_dataset
+
+    train(accelerator, logger, train_dataset, test_dataset, model, args, output_dir=args.out_dir, output_prefix=args.prefix)
     # REMINDER: Changed ReLUs to GeLUs
 
 

@@ -1,2 +1,8 @@
 checkpoints/
 *.npz
+*.txt
+*.csv
+wandb/
+__pycache__
+gpt_test
+*_weights*
