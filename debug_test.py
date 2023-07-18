@@ -656,9 +656,12 @@ def main():
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
     parser.add_argument('--log', action='store_true', default=False)
     parser.add_argument('--max_grad_norm', type=float, default=4)
+    parser.add_argument('--target', type=str, default=None)
+
     args = parser.parse_args()
     assert args.train_data is not None, "Pass a path for your preprocessed training data."
     assert args.eval_data is not None, "Pass a path for your preprocessed eval data."
+    inp_target = args.target
 
     gradient_accumulation_steps = 1
     per_device_eval_batch_size = 1
@@ -795,10 +798,12 @@ def main():
         "APP": "ovr",
         "rapamycin": "compounds",
         "DL-ALPHA-TOCOPHEROL": "compounds",
+        "torin2": "compounds",
     }
     inchis = {
         "rapamycin": "InChI=1S/C56H87NO16/c1-33-17-13-12-14-18-34(2)45(68-9)29-41-22-20-39(7)56(67,73-41)51(63)52(64)57-24-16-15-19-42(57)53(65)71-46(30-43(60)35(3)26-38(6)49(62)50(70-11)48(61)37(5)25-33)36(4)27-40-21-23-44(47(28-40)69-10)72-54(66)55(8,31-58)32-59/h12-14,17-18,26,33,36-42,44-47,49-50,58-59,62,67H,15-16,19-25,27-32H2,1-11H3",
         "DL-ALPHA-TOCOPHEROL": "InChI=1S/C29H50O2/c1-20(2)12-9-13-21(3)14-10-15-22(4)16-11-18-29(8)19-17-26-25(7)27(30)23(5)24(6)28(26)31-29/h20-22,30H,9-19H2,1-8H3",
+        "torin2": "InChI=1S/C24H15F3N4O/c25-24(26,27)17-2-1-3-18(11-17)31-22(32)9-6-16-13-29-20-7-4-14(10-19(20)23(16)31)15-5-8-21(28)30-12-15/h1-13H,(H2,28,30)"
     }
 
     version = 0.2
@@ -810,8 +815,14 @@ def main():
     # Start with SOD1 to see if we generate antiox-like mols
     orfs, target_morph = data["orfs"], data["target"].astype(np.float32)
     crisprs, crispr_data = data["crisprs"], data["crispr_target"].astype(np.float32)
+    limit = 10
 
-    sel_target = "DL-ALPHA-TOCOPHEROL"  # "rapamycin"  # "PKD2"  # "PKD2"  # "SOD1"
+    if inp_target is None:
+        # Override with default
+        sel_target = "torin2"  # "DL-ALPHA-TOCOPHEROL"  # "rapamycin"  # "PKD2"  # "PKD2"  # "SOD1"
+        sel_target = "SOD1"
+    else:
+        sel_target = inp_target
     target_modality = targets[sel_target]
 
     if target_modality == "ovr":
@@ -843,6 +854,7 @@ def main():
             comps = data["train_inchis"]
             train_morph = data["train_morphology"]
             target_idx = comps == inchis[sel_target]
+            target_idx = np.where(target_idx)[0][:limit]
             sel_morph = train_morph[target_idx]
             sel_orfs = comps[target_idx]
             sel_morph = torch.from_numpy(sel_morph)
@@ -892,7 +904,7 @@ def main():
     model.eval()
 
     gens, cumsum = [], []
-    embs = []
+    pre_embs, embs = [], []
     if not optimize_hits:
         start_token = tokenizer.encode(GALACTICA_START, return_tensors="pt").to(device)
         for morph, manip in tqdm(zip(sel_morph, sel_orfs), total=len(sel_morph), desc="Processing genetic manipulations"):
@@ -966,13 +978,14 @@ def main():
                     else:
                         tokens = torch.cat((tokens, next_token), dim=1)
                     if stop_token_index == next_token.item():
-                        final_emb = generated[:, [-1]].detach().cpu().numpy()
+                        final_emb = generated[0, prefix_length:].mean(0, keepdims=True).cpu().numpy()
                         break
 
                 mu_prob = np.mean(probs)
                 gens.append(tokenizer.decode(tokens.squeeze(), skip_special_tokens=True))
                 cumsum.append(mu_prob)
                 embs.append(final_emb)
+                pre_embs.append(it_prefix)
     else:
 
         start_token = tokenizer.encode(GALACTICA_START, return_tensors="pt").to(device)
@@ -1047,7 +1060,8 @@ def main():
                             tokens = torch.cat((tokens, next_token), dim=1)
                         if stop_token_index == next_token.item():
                             break
-                    final_emb = generated[:, [-1]].detach().cpu().numpy()
+                    # final_emb = generated[:, [-1]].detach().cpu().numpy()
+                    final_emb = generated[0, prefix_length + 1: -1].mean(0, keepdims=True).cpu().numpy()  # +1 and -1 on the prefix length to skip the SMILES-start/end tokens
                     mu_prob = np.mean(probs)
                     print(mu_prob)
                     if mu_prob > 0.93:
@@ -1067,20 +1081,20 @@ def main():
                 gens.append(tokenizer.decode(tokens.squeeze(), skip_special_tokens=True))
                 cumsum.append(mu_prob)
                 embs.append(emb)
+                pre_embs.append(it_prefix)
 
-    gens, cumsum
     df = pd.DataFrame(np.stack((gens, cumsum), 1), columns=["smiles", "confidence"])
     if "InChI" in manip:
         manip = sel_target
     df.to_csv("generated_{}_{}.csv".format(manip, target_modality))
-    np.savez("generated_{}_{}.csv".format(manip, target_modality), smiles=gens, confidence=cumsum, embs=embs)
+    np.savez("generated_{}_{}.csv".format(manip, target_modality), smiles=gens, confidence=cumsum, embs=embs, pre_embs=pre_embs)
 
     # sort_idx = np.argsort(np.asarray([len(x) for x in gens]))
     sort_idx = np.argsort(cumsum)[::-1]
     sort_df = pd.DataFrame(np.stack((np.asarray(gens)[sort_idx], np.asarray(cumsum)[sort_idx]), 1), columns=["smiles", "confidence"])
     sort_df.to_csv("sorted_generated_{}_{}.csv".format(manip, target_modality))
 
-
+    os._exit(1)  # Need to clean below this part
     import pdb;pdb.set_trace()
     compute_loss = True
 
