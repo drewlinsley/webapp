@@ -796,6 +796,12 @@ def main():
         "PKD2": "ovr",
         "TARDBP": "ovr",
         "APP": "ovr",
+        "MYC": "ovr",
+        "ERBB2": "ovr",
+        "CXCL1": "ovr",
+        "SNCA": "ovr",
+        "PSEN1": "ovr",
+        "MAPT": "ovr",
         "rapamycin": "compounds",
         "DL-ALPHA-TOCOPHEROL": "compounds",
         "torin2": "compounds",
@@ -890,7 +896,8 @@ def main():
     temperature = 1.
     top_k = 0  # Strict threshold on top tokens
     top_p = 0.90  # Nucleus sampling
-    sample_tokens = True
+    sample_tokens = False  # True
+    optimize_hits = False  # True  # True
     num_repeats = 20
     stop_token = GALACTICA_END
     stop_token_index = tokenizer.encode(stop_token)[0]
@@ -899,7 +906,6 @@ def main():
     gpt_embedding_size = model.gpt.model.model.decoder.embed_tokens.weight.shape[1]
     max_val_count = 100
     beam_size = 10
-    optimize_hits = True
     
     model.eval()
 
@@ -978,14 +984,15 @@ def main():
                     else:
                         tokens = torch.cat((tokens, next_token), dim=1)
                     if stop_token_index == next_token.item():
-                        final_emb = generated[0, prefix_length:].mean(0, keepdims=True).cpu().numpy()
+                        # final_emb = generated[0, prefix_length:].mean(0, keepdims=True).cpu().numpy()
+                        final_emb = generated[0, prefix_length:].max(0)[0].detach().cpu().numpy()
                         break
 
                 mu_prob = np.mean(probs)
                 gens.append(tokenizer.decode(tokens.squeeze(), skip_special_tokens=True))
                 cumsum.append(mu_prob)
                 embs.append(final_emb)
-                pre_embs.append(it_prefix)
+                pre_embs.append(it_prefix.detach().cpu().numpy())
     else:
 
         start_token = tokenizer.encode(GALACTICA_START, return_tensors="pt").to(device)
@@ -1061,7 +1068,8 @@ def main():
                         if stop_token_index == next_token.item():
                             break
                     # final_emb = generated[:, [-1]].detach().cpu().numpy()
-                    final_emb = generated[0, prefix_length + 1: -1].mean(0, keepdims=True).cpu().numpy()  # +1 and -1 on the prefix length to skip the SMILES-start/end tokens
+                    # final_emb = generated[0, prefix_length + 1: -1].mean(0, keepdims=True).cpu().numpy()  # +1 and -1 on the prefix length to skip the SMILES-start/end tokens
+                    final_emb = generated[0, prefix_length + 1: -1].max(0)[0].detach().cpu().numpy()  # +1 and -1 on the prefix length to skip the SMILES-start/end tokens
                     mu_prob = np.mean(probs)
                     print(mu_prob)
                     if mu_prob > 0.93:
@@ -1081,7 +1089,7 @@ def main():
                 gens.append(tokenizer.decode(tokens.squeeze(), skip_special_tokens=True))
                 cumsum.append(mu_prob)
                 embs.append(emb)
-                pre_embs.append(it_prefix)
+                pre_embs.append(it_prefix.detach().cpu().numpy())
 
     df = pd.DataFrame(np.stack((gens, cumsum), 1), columns=["smiles", "confidence"])
     if "InChI" in manip:

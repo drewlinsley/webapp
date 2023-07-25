@@ -40,6 +40,7 @@ GALACTICA_END = "[END_SMILES]"
 PRETRAINED = "ncfrey/ChemGPT-1.2B"
 PRETRAINED = "../smiles-gpt/checkpoints/benchmark-10m"
 PRETRAINED = "facebook/galactica-1.3b"
+PRETRAINED = "facebook/galactica-125m"
 CACHE_DIR = "/media/data_cifs/projects/prj_video_imagenet/hf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -85,7 +86,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_data', default=None)
     parser.add_argument('--eval_data', default=None)
-    parser.add_argument('--out_dir', default='./checkpoints')
+    # parser.add_argument('--out_dir', default='./checkpoints')
     parser.add_argument('--prefix', default='coco_prefix', help='prefix for saved filenames')
     parser.add_argument('--epochs', type=int, default=120)
     parser.add_argument('--save_every', type=int, default=1)
@@ -110,7 +111,7 @@ def main():
     learning_rate = 1e-4
     use_lora = True
 
-    ckpt_output_dir = "llm_weights_v2"
+    ckpt_output_dir = "llm_weights_v2_{}".format(PRETRAINED.split("/")[1])
     if not os.path.exists(ckpt_output_dir):
         os.makedirs(ckpt_output_dir, exist_ok=True)
     # bos_token='[CLS]', eos_token='[SEP]', pad_token='[PAD]'

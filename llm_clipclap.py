@@ -39,7 +39,8 @@ GALACTICA_START = "[START_SMILES]"
 GALACTICA_END = "[END_SMILES]"
 PRETRAINED = "ncfrey/ChemGPT-1.2B"
 PRETRAINED = "../smiles-gpt/checkpoints/benchmark-10m"
-PRETRAINED = "facebook/galactica-1.3b"
+# PRETRAINED = "facebook/galactica-1.3b"
+PRETRAINED = "facebook/galactica-125m"
 CACHE_DIR = "/media/data_cifs/projects/prj_video_imagenet/hf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -251,6 +252,7 @@ class ClipCaptionModel(nn.Module):
         if ckpt is not None:
             kv = torch.load(ckpt, map_location=torch.device('cpu'))["model"]
             # kv = {k.replace("base_model.model.", ""): v for k, v in kv.items()}
+            import pdb;pdb.set_trace()
             model.load_state_dict(kv)
         self.gpt = model
 
@@ -327,7 +329,13 @@ def main():
     prefix_dim = 1024  # 1280 * 5
     num_layers = 8
     mapping_type = "transformer"
-    ckpt_output_dir = "clipclap_llm_weights_v2"
+
+
+    ckpt = "llm_weights/step_41500_eval_0.5636716485023499.pth"
+    ckpt = "llm_weights_v2_galactica-125m/step_34500_eval_0.5711127519607544.pth"
+    # ckpt_output_dir = "clipclap_llm_weights_v2"
+    ckpt_output_dir = "clipclap_llm_weights_{}".format(PRETRAINED.split("/")[-1])
+    # ckpt_output_dir = "clipclap_llm_weights_v2-125m"  # "clipclap_llm_weights_v2"  # llm_weights_v2_galactica-125m
     # bos_token='[CLS]', eos_token='[SEP]', pad_token='[PAD]'
 
     if args.log:
@@ -377,7 +385,6 @@ def main():
     else:
         tokenizer = AutoTokenizer.from_pretrained(PRETRAINED, cache_dir=CACHE_DIR, bos_token=bos, eos_token=eos, pad_token=pad)
 
-    ckpt = "llm_weights/step_41500_eval_0.5636716485023499.pth"
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
         model = ClipCaptionPrefix(prefix_length, clip_length=prefix_length_clip, prefix_size=prefix_dim,
